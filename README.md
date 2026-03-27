@@ -30,11 +30,34 @@ npm run preview
 
 ## Docker
 
+### Docker Compose
+
 ```bash
 docker compose up --build
 ```
 
-Serves the production build on [http://localhost:3000](http://localhost:3000) via Nginx.
+### Manual Docker Build & Run
+
+```bash
+git clone https://github.com/celerycelery/dash.git
+cd dash
+docker build -t dash-and-burn .
+docker run -d -p 3000:80 --name DashAndBurn dash-and-burn
+```
+
+### Unraid
+
+Unraid cannot build images from a Git URL directly. You have two options:
+
+**Option A — SSH / terminal:**
+
+SSH into your Unraid server and run the manual build commands above.
+
+**Option B — Use a pre-built image:**
+
+If the image is published to a registry (e.g. Docker Hub or GHCR), use that image name in the Unraid Docker UI instead of the GitHub URL.
+
+Once running, access the game at `http://<your-server-ip>:3000`.
 
 ## Scripts
 
