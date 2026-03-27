@@ -1,16 +1,46 @@
-# React + Vite
+# Dash & Burn
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+An interactive browser game about the slippery slope of dashboard manipulation. You play as a data analyst at **Synergex**, a startup where well-meaning colleagues keep asking you to make the metrics look "just a little better" before the board meeting, the investor pitch, or the OKR review.
 
-Currently, two official plugins are available:
+Each round, you receive a message from a coworker requesting a change to a key business metric — revenue, MAU, churn, burn rate, conversion, or NPS. You control the dashboard: pick metric definitions, adjust date ranges, choose chart types, and toggle segments. Every tweak is tracked. The deeper you go, the harder it gets to walk back.
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+The game spans 20 rounds across 4 quarters, culminating in an audit that scores how much you manipulated — or held the line.
 
-## React Compiler
+## Tech Stack
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+- **React 19** with Vite 8
+- **Recharts** for interactive charts
+- **Tailwind CSS 4** for styling
 
-## Expanding the ESLint configuration
+## Getting Started
 
-If you are developing a production application, we recommend using TypeScript with type-aware lint rules enabled. Check out the [TS template](https://github.com/vitejs/vite/tree/main/packages/create-vite/template-react-ts) for information on how to integrate TypeScript and [`typescript-eslint`](https://typescript-eslint.io) in your project.
+```bash
+npm install
+npm run dev
+```
+
+Open [http://localhost:5173](http://localhost:5173) in your browser.
+
+## Production Build
+
+```bash
+npm run build
+npm run preview
+```
+
+## Docker
+
+```bash
+docker compose up --build
+```
+
+Serves the production build on [http://localhost:3000](http://localhost:3000) via Nginx.
+
+## Scripts
+
+| Command | Description |
+| --- | --- |
+| `npm run dev` | Start the Vite dev server with HMR |
+| `npm run build` | Build for production |
+| `npm run preview` | Preview the production build locally |
+| `npm run lint` | Run ESLint |
