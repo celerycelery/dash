@@ -1510,9 +1510,6 @@ export default function DashAndBurn() {
   if (state.phase === 'quarterReview') {
     return (
       <>
-        <div className="h-screen flex flex-col bg-gray-100">
-          <ScoreBar scores={state.scores} deltas={state.scoreDeltas} round={state.round} quarter={state.quarter} integrity={state.scores.integrity} onToggleSidebar={() => setSidebarOpen(o => !o)} sidebarOpen={sidebarOpen} />
-        </div>
         <QuarterReview
           quarter={state.quarter}
           scores={state.scores}
@@ -1526,7 +1523,7 @@ export default function DashAndBurn() {
 
   // Main game view (message, manipulation, submission, transition)
   return (
-    <div className="h-screen flex flex-col bg-gradient-to-br from-gray-50 to-blue-50/30 overflow-hidden">
+    <div className="h-dvh flex flex-col bg-gradient-to-br from-gray-50 to-blue-50/30 overflow-hidden">
       <ScoreBar scores={state.scores} deltas={state.scoreDeltas} round={state.round} quarter={state.quarter} integrity={state.scores.integrity} onToggleSidebar={() => setSidebarOpen(o => !o)} sidebarOpen={sidebarOpen} />
 
       <div className="flex flex-1 overflow-hidden">
