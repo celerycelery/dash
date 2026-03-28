@@ -706,13 +706,20 @@ function buildRoundMessages(round, ticket, state) {
   }
 
   // ambient messages for this round
-  const ambients = AMBIENT_MSGS.filter(a => round >= a.rounds[0] && round <= a.rounds[1]);
-  // pick up to 2
-  for (let i = 0; i < Math.min(2, ambients.length); i++) {
-    const a = ambients[i];
-    const id = `ambient_${round}_${i}`;
+  const ambients = AMBIENT_MSGS
+    .map((a, idx) => ({ ...a, _idx: idx }))
+    .filter(a => round >= a.rounds[0] && round <= a.rounds[1]);
+  // shuffle deterministically by round so each round gets different messages
+  const rng = mulberry32(round * 7919);
+  const shuffled = ambients.slice().sort(() => rng() - 0.5);
+  // pick up to 2 that haven't been delivered yet
+  let picked = 0;
+  for (const a of shuffled) {
+    if (picked >= 2) break;
+    const id = `ambient_${a._idx}`;
     if (!state.deliveredMsgIds?.[id]) {
       msgs.push({ id, sender: a.sender, avatar: a.avatar, body: a.body, type: 'company', reactions: a.reactions });
+      picked++;
     }
   }
 
