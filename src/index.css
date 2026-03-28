@@ -68,7 +68,13 @@ html, body, #root {
   background-size: 200% 100%;
   animation: shimmer 2s infinite;
 }
+@keyframes pulse-glow-danger {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0); }
+  50% { box-shadow: 0 0 12px 4px rgba(239, 68, 68, 0.4); }
+}
+
 .animate-pulse-glow { animation: pulse-glow 2s infinite; }
+.animate-pulse-glow-danger { animation: pulse-glow-danger 1.5s infinite; }
 
 /* Fun hover effects */
 .hover-bounce:hover { transform: translateY(-2px); transition: transform 0.2s; }

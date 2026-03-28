@@ -400,7 +400,123 @@ function computeSuspicionCost(manipType, typeCounts, baseCost) {
   return baseCost + count * 2;
 }
 
-function checkConsistencies() { return []; }
+/* ── Shared cost calculation (used by both SUBMIT_REPORT and live preview) ── */
+const BASE_COSTS = { dateRange: 2, variant: 0, segments: 3, chartType: 1, formula: 8 };
+
+function computeFilterCost(metricId, filterKey, filterValue, typeCounts) {
+  if (filterKey === 'variant') {
+    const v = (METRIC_VARIANTS[metricId] || []).find(v => v.name === filterValue);
+    return v ? computeSuspicionCost('variant', typeCounts, v.susp) : 0;
+  }
+  if (filterKey === 'formula') {
+    if (!filterValue || !filterValue.trim()) return 0;
+    const testVal = parseFormula(filterValue, 100);
+    const ratio = testVal / 100;
+    if (ratio > 3) return computeSuspicionCost('formula', typeCounts, 25);
+    if (ratio > 1.5) return computeSuspicionCost('formula', typeCounts, 15);
+    return computeSuspicionCost('formula', typeCounts, 8);
+  }
+  if (filterKey === 'chartType') {
+    return filterValue === 'Number Only' ? computeSuspicionCost('chartType', typeCounts, 4) : 0;
+  }
+  if (filterKey === 'segments') return 0; // segments are handled per-toggle in the panel
+  return computeSuspicionCost(filterKey, typeCounts, BASE_COSTS[filterKey] || 2);
+}
+
+function computeRoundCosts(pendingManipulations, typeCounts, round, ticket) {
+  let totalSusp = 0;
+  const details = [];
+  for (const [mId, filterChanges] of Object.entries(pendingManipulations || {})) {
+    for (const [filterKey, filterValue] of Object.entries(filterChanges)) {
+      let suspCost = computeFilterCost(mId, filterKey, filterValue, typeCounts);
+      if (round === 19 && ticket?.doubleSuspicion) suspCost *= 2;
+      totalSusp += suspCost;
+      if (suspCost > 0) {
+        const metricName = METRIC_DEFS[mId]?.name || mId;
+        const desc = filterKey === 'variant' ? `Definition → "${filterValue}"`
+          : filterKey === 'formula' ? `Formula: ${filterValue}`
+          : filterKey === 'dateRange' ? `Date range → ${filterValue}`
+          : filterKey === 'chartType' ? `Chart → ${filterValue}`
+          : `Changed ${filterKey}`;
+        details.push({ metricName, desc, suspCost });
+      }
+    }
+  }
+  // segment costs from current metric states (not in pending as object)
+  for (const [mId, filterChanges] of Object.entries(pendingManipulations || {})) {
+    if (filterChanges.segments) {
+      const segs = filterChanges.segments;
+      let segCost = 0;
+      if (!segs.enterprise || !segs.smb || !segs.consumer) segCost += computeSuspicionCost('segments', typeCounts, 3);
+      if (segs.internal) segCost += computeSuspicionCost('segments', typeCounts, 7);
+      if (round === 19 && ticket?.doubleSuspicion) segCost *= 2;
+      totalSusp += segCost;
+      if (segCost > 0) {
+        details.push({ metricName: METRIC_DEFS[mId]?.name || mId, desc: 'Segment filtering', suspCost: segCost });
+      }
+    }
+  }
+  const totalInt = Math.round(totalSusp * 0.7);
+  return { totalSusp, totalInt, details };
+}
+
+/* ── Contradiction detection ── */
+function checkConsistencies(metrics, manipulationHistory) {
+  const contradictions = [];
+
+  // 1. Variant flip-flopping: same metric used different definitions across rounds
+  const variantsByMetric = {};
+  for (const m of manipulationHistory) {
+    if (m.filterKey === 'variant') {
+      if (!variantsByMetric[m.metricId]) variantsByMetric[m.metricId] = new Set();
+      variantsByMetric[m.metricId].add(m.filterValue);
+    }
+  }
+  for (const [metricId, variants] of Object.entries(variantsByMetric)) {
+    if (variants.size > 1) {
+      contradictions.push({
+        type: 'variant_flip',
+        metricId,
+        detail: `${METRIC_DEFS[metricId].name} has used ${variants.size} different definitions`,
+      });
+    }
+  }
+
+  // 2. MAU inflated while conversion not — more users should mean lower conversion
+  const mauVariant = metrics.mau?.filters?.variant;
+  const convVariant = metrics.conversion?.filters?.variant;
+  const mauDefault = METRIC_VARIANTS.mau?.[0]?.name;
+  const convDefault = METRIC_VARIANTS.conversion?.[0]?.name;
+  const mauInflated = mauVariant && mauVariant !== mauDefault;
+  const convInflated = convVariant && convVariant !== convDefault;
+  if (mauInflated && !convInflated) {
+    contradictions.push({
+      type: 'cross_metric',
+      metricId: 'mau',
+      detail: 'Inflated MAU conflicts with uninflated Conversion Rate',
+    });
+  }
+
+  // 3. Revenue up + burn rate up = contradicts efficiency narrative
+  const revVariant = metrics.revenue?.filters?.variant;
+  const burnVariant = metrics.burnRate?.filters?.variant;
+  const revDefault = METRIC_VARIANTS.revenue?.[0]?.name;
+  const burnDefault = METRIC_VARIANTS.burnRate?.[0]?.name;
+  if (revVariant && revVariant !== revDefault && burnVariant && burnVariant !== burnDefault) {
+    const burnDef = (METRIC_VARIANTS.burnRate || []).find(v => v.name === burnVariant);
+    if (burnDef && burnDef.mult < 1) {
+      // burn is being deflated while revenue inflated — that's narrative, not contradiction
+    } else {
+      contradictions.push({
+        type: 'cross_metric',
+        metricId: 'revenue',
+        detail: 'Revenue and Burn Rate both use non-standard definitions',
+      });
+    }
+  }
+
+  return contradictions;
+}
 
 function getQuarter(round) { return Math.ceil(round / 5); }
 
@@ -451,6 +567,8 @@ function buildInitialState() {
     ticketMet: false,
     seriesCS쳮ded: null,
     scoreDeltas: null,
+    previousScores: null,
+    lastRoundManipDetails: [],
     pendingManipulations: {},
     lastRoundManipulations: {},
     gameOverReason: null,
@@ -502,7 +620,7 @@ function gameReducer(state, action) {
       return {
         ...state,
         metrics: newMetrics,
-        contradictions: [],
+        contradictions: checkConsistencies(newMetrics, state.manipulationHistory),
         pendingManipulations: pendingManips,
         scoreDeltas: null,
       };
@@ -542,45 +660,26 @@ function gameReducer(state, action) {
       }
 
       // ── Score all pending manipulations from this round ──
-      const baseCosts = { dateRange: 2, variant: 0, segments: 3, chartType: 1, formula: 8 };
+      const { totalSusp: totalSuspCost, totalInt: totalIntCost, details: manipDetails } =
+        computeRoundCosts(state.pendingManipulations, state.manipulationTypeCounts, state.round, state.currentTicket);
+
       const newTypeCounts = { ...state.manipulationTypeCounts };
       const newHistory = [...state.manipulationHistory];
-      let totalSuspCost = 0;
-      let totalIntCost = 0;
-
       for (const [mId, filterChanges] of Object.entries(state.pendingManipulations || {})) {
         for (const [filterKey, filterValue] of Object.entries(filterChanges)) {
           newTypeCounts[filterKey] = (newTypeCounts[filterKey] || 0) + 1;
-
-          let suspCost = 0;
-          if (filterKey === 'variant') {
-            const v = (METRIC_VARIANTS[mId] || []).find(v => v.name === filterValue);
-            suspCost = v ? computeSuspicionCost('variant', state.manipulationTypeCounts, v.susp) : 0;
-          } else if (filterKey === 'formula') {
-            const testVal = parseFormula(filterValue, 100);
-            const ratio = testVal / 100;
-            if (ratio > 3) suspCost = computeSuspicionCost('formula', state.manipulationTypeCounts, 25);
-            else if (ratio > 1.5) suspCost = computeSuspicionCost('formula', state.manipulationTypeCounts, 15);
-            else suspCost = computeSuspicionCost('formula', state.manipulationTypeCounts, 8);
-          } else if (filterKey === 'chartType' && filterValue === 'Number Only') {
-            suspCost = computeSuspicionCost('chartType', state.manipulationTypeCounts, 4);
-          } else {
-            suspCost = computeSuspicionCost(filterKey, state.manipulationTypeCounts, baseCosts[filterKey] || 2);
-          }
-
-          // double suspicion on round 19
-          if (state.round === 19 && state.currentTicket?.doubleSuspicion) suspCost *= 2;
-
-          totalSuspCost += suspCost;
-          totalIntCost += Math.round(suspCost * 0.7);
+          const suspCost = computeFilterCost(mId, filterKey, filterValue, state.manipulationTypeCounts);
           newHistory.push({ round: state.round, metricId: mId, filterKey, filterValue, suspCost });
         }
       }
 
+      // check contradictions before scoring
+      const contradictions = checkConsistencies(metrics, newHistory);
+
       const rng = mulberry32(state.round * 1000);
       const repDelta = success ? Math.floor(5 + rng() * 10) : -Math.floor(10 + rng() * 10);
       const suspDecay = -3;
-      const contSusp = state.contradictions.length * 2;
+      const contSusp = contradictions.length * 2;
 
       const newScores = {
         reputation: Math.min(100, Math.max(0, state.scores.reputation + repDelta)),
@@ -617,9 +716,12 @@ function gameReducer(state, action) {
         ...state,
         phase: nextPhase,
         scores: newScores,
+        previousScores: { ...state.scores },
         ticketMet: success,
         messages: [...state.messages, responseMsg],
         scoreDeltas: { reputation: repDelta, suspicion: totalSuspCost + suspDecay + contSusp, integrity: -totalIntCost },
+        lastRoundManipDetails: manipDetails,
+        contradictions,
         manipulationHistory: newHistory,
         manipulationTypeCounts: newTypeCounts,
         pendingManipulations: {},
@@ -777,11 +879,11 @@ function ScoreBar({ scores, deltas, round, quarter, integrity, onToggleSidebar, 
       <div className="flex items-center gap-1.5 sm:gap-3 text-xs sm:text-sm">
         <span className="text-gray-500 font-medium">{roundEmoji} <span className="hidden sm:inline">Round </span>{round}/20</span>
         <span className="bg-blue-100 text-blue-700 px-1.5 py-0.5 rounded text-xs font-bold">Q{quarter}</span>
-        <span className={`${repColor} font-medium`} title="Reputation">
+        <span className={`${repColor} font-medium ${scores.reputation <= 20 ? 'animate-pulse-glow-danger rounded px-1 bg-red-500/10' : ''}`} title="Reputation">
           ⭐{scores.reputation}
           {deltas?.reputation ? <span className={`text-xs ml-0.5 animate-score-bump ${deltas.reputation > 0 ? 'text-green-400' : 'text-red-400'}`}>({deltas.reputation > 0 ? '+' : ''}{deltas.reputation})</span> : null}
         </span>
-        <span className={`${suspColor} font-medium`} title="Suspicion">
+        <span className={`${suspColor} font-medium ${scores.suspicion >= 80 ? 'animate-pulse-glow-danger rounded px-1 bg-red-500/10' : ''}`} title="Suspicion">
           👁{scores.suspicion}
           {deltas?.suspicion ? <span className={`text-xs ml-0.5 animate-score-bump ${deltas.suspicion > 0 ? 'text-red-400' : 'text-green-400'}`}>({deltas.suspicion > 0 ? '+' : ''}{deltas.suspicion})</span> : null}
         </span>
@@ -951,7 +1053,9 @@ function MetricChart({ metricId, metric, filters, isSelected, onClick }) {
 }
 
 // ─── Filter Panel ───
-function FilterPanel({ metricId, metric, dispatch, manipTypeCounts, round, currentTicket }) {
+const CostBadge = ({ cost }) => cost > 0 ? <span className="text-[10px] text-orange-500 font-medium ml-1">+{cost} 👁</span> : null;
+
+function FilterPanel({ metricId, metric, dispatch, manipTypeCounts, round, currentTicket, pendingManipulations }) {
   const filters = metric.filters;
   const def = METRIC_DEFS[metricId];
   const variants = METRIC_VARIANTS[metricId] || [];
@@ -964,22 +1068,31 @@ function FilterPanel({ metricId, metric, dispatch, manipTypeCounts, round, curre
 
   const upd = (key, val) => dispatch({ type: 'UPDATE_FILTER', metricId, filterKey: key, filterValue: val });
 
-  const naughtyLevel = (() => {
-    let s = 0;
-    if (filters.dateRange !== 'Last 30 days') s += 2;
-    if (filters.variant !== Object.keys(variants || {})[0]) s += 4;
-    if (filters.formula) s += 8;
-    if (!filters.segments?.enterprise || !filters.segments?.smb || !filters.segments?.consumer) s += 3;
-    if (filters.segments?.internal) s += 7;
-    return s;
-  })();
-  const naughtyLabel = naughtyLevel === 0 ? '😇 Squeaky clean' : naughtyLevel < 5 ? '🤔 Slightly massaged' : naughtyLevel < 10 ? '😈 Getting creative' : naughtyLevel < 15 ? '🔥 Spicy accounting' : '💀 Securities fraud adjacent';
+  // Live cost preview — compute what this round's manipulations will cost
+  const { totalSusp, totalInt } = computeRoundCosts(pendingManipulations, manipTypeCounts, round, currentTicket);
+
+  // Per-control marginal costs
+  const dateRangeCost = filters.dateRange !== 'Last 30 days' ? computeSuspicionCost('dateRange', manipTypeCounts, 2) : 0;
+  const variantObj = variants.find(v => v.name === filters.variant) || variants[0];
+  const variantCost = variantObj && variantObj !== variants[0] && variantObj.susp > 0 ? computeSuspicionCost('variant', manipTypeCounts, variantObj.susp) : 0;
+  const formulaCost = filters.formula ? computeFilterCost(metricId, 'formula', filters.formula, manipTypeCounts) : 0;
+  const chartCost = filters.chartType === 'Number Only' ? computeSuspicionCost('chartType', manipTypeCounts, 4) : 0;
+  const segNonDefault = !filters.segments?.enterprise || !filters.segments?.smb || !filters.segments?.consumer;
+  const segInternal = !!filters.segments?.internal;
+  const segCost = (segNonDefault ? computeSuspicionCost('segments', manipTypeCounts, 3) : 0) + (segInternal ? computeSuspicionCost('segments', manipTypeCounts, 7) : 0);
+
+  const naughtyLabel = totalSusp === 0 ? '😇 Clean' : totalSusp < 5 ? '🤔 Massaged' : totalSusp < 12 ? '😈 Creative' : totalSusp < 20 ? '🔥 Spicy' : '💀 Fraud-adjacent';
 
   return (
     <div className="bg-gradient-to-r from-gray-50 to-blue-50/30 border-t border-gray-200 p-4 space-y-3 filter-panel-enter">
       <div className="flex items-center justify-between mb-2">
         <h3 className="font-semibold text-sm text-gray-700">🔧 Configure: {def.name}</h3>
-        <div className="flex items-center gap-3">
+        <div className="flex items-center gap-2 sm:gap-3 flex-wrap justify-end">
+          {totalSusp > 0 && (
+            <span className={`text-xs px-2 py-0.5 rounded-full font-medium border ${totalSusp < 10 ? 'bg-orange-50 text-orange-600 border-orange-200' : 'bg-red-50 text-red-600 border-red-200'}`}>
+              👁 +{totalSusp} suspicion · 💎 -{totalInt} integrity
+            </span>
+          )}
           <span className="text-xs px-2 py-0.5 rounded-full bg-purple-50 text-purple-600 border border-purple-200">{naughtyLabel}</span>
           {conditionMet !== null && (
             <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${conditionMet ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-700'}`}>
@@ -993,7 +1106,7 @@ function FilterPanel({ metricId, metric, dispatch, manipTypeCounts, round, curre
       <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
         {/* Date Range */}
         <label className="space-y-1">
-          <span className="text-xs text-gray-500">Date Range</span>
+          <span className="text-xs text-gray-500">Date Range <CostBadge cost={dateRangeCost} /></span>
           <select value={filters.dateRange} onChange={e => upd('dateRange', e.target.value)}
             className="w-full text-xs border border-gray-300 rounded px-2 py-1.5 bg-white">
             {DATE_RANGES.map(d => <option key={d.label} value={d.label}>{d.label}</option>)}
@@ -1002,7 +1115,7 @@ function FilterPanel({ metricId, metric, dispatch, manipTypeCounts, round, curre
 
         {/* Variant */}
         <label className="space-y-1">
-          <span className="text-xs text-gray-500">Metric Definition</span>
+          <span className="text-xs text-gray-500">Metric Definition <CostBadge cost={variantCost} /></span>
           <select value={filters.variant} onChange={e => upd('variant', e.target.value)}
             className="w-full text-xs border border-gray-300 rounded px-2 py-1.5 bg-white">
             {variants.map(v => <option key={v.name} value={v.name}>{v.name} {v.susp > 0 ? `(+${v.susp} 👁)` : ''}</option>)}
@@ -1011,7 +1124,7 @@ function FilterPanel({ metricId, metric, dispatch, manipTypeCounts, round, curre
 
         {/* Chart Type */}
         <label className="space-y-1">
-          <span className="text-xs text-gray-500">Chart Type</span>
+          <span className="text-xs text-gray-500">Chart Type <CostBadge cost={chartCost} /></span>
           <select value={filters.chartType} onChange={e => upd('chartType', e.target.value)}
             className="w-full text-xs border border-gray-300 rounded px-2 py-1.5 bg-white">
             {CHART_TYPES.map(c => <option key={c} value={c}>{c}</option>)}
@@ -1020,7 +1133,7 @@ function FilterPanel({ metricId, metric, dispatch, manipTypeCounts, round, curre
 
         {/* Formula */}
         <label className="space-y-1">
-          <span className="text-xs text-gray-500">Formula Override</span>
+          <span className="text-xs text-gray-500">Formula Override <CostBadge cost={formulaCost} /></span>
           <input type="text" value={filters.formula} placeholder="e.g. * 1.5"
             onChange={e => upd('formula', e.target.value)}
             className="w-full text-xs border border-gray-300 rounded px-2 py-1.5 font-mono" />
@@ -1028,7 +1141,7 @@ function FilterPanel({ metricId, metric, dispatch, manipTypeCounts, round, curre
 
         {/* Segments */}
         <div className="space-y-1 col-span-2">
-          <span className="text-xs text-gray-500">Segments</span>
+          <span className="text-xs text-gray-500">Segments <CostBadge cost={segCost} /></span>
           <div className="flex flex-wrap gap-1.5 sm:gap-2">
             {Object.entries(SEGMENTS).map(([seg, pct]) => (
               <label key={seg} className={`flex items-center gap-1 text-xs px-2 py-1 rounded border cursor-pointer transition-colors ${filters.segments[seg] ? 'bg-blue-50 border-blue-300 text-blue-700' : 'bg-gray-100 border-gray-200 text-gray-500'}`}>
@@ -1546,15 +1659,56 @@ export default function DashAndBurn() {
           )}
 
           {state.phase === 'transition' && (
-            <div className={`${state.ticketMet ? 'bg-gradient-to-r from-green-50 to-emerald-50 border-green-200' : 'bg-gradient-to-r from-red-50 to-orange-50 border-red-200'} border-b px-4 py-2.5 flex items-center justify-between animate-slide-up`}>
-              <span className={`text-sm font-medium ${state.ticketMet ? 'text-green-700' : 'text-red-700'}`}>
-                {state.ticketMet ? '✅ Nailed it! Management is delighted (and none the wiser).' : '❌ Didn\'t quite sell it. Management is... disappointed.'}
-                {state.contradictions.length > 0 && ` 🕵️ ${state.contradictions.length} suspicious inconsistenc${state.contradictions.length === 1 ? 'y' : 'ies'} detected!`}
-              </span>
-              <button onClick={() => dispatch({ type: 'NEXT_ROUND' })}
-                className="bg-gradient-to-r from-green-600 to-emerald-500 text-white px-5 py-1.5 rounded-lg text-sm font-medium hover:from-green-500 hover:to-emerald-400 transition-all hover:scale-105 shadow-sm">
-                Next Round 🎲
-              </button>
+            <div className={`${state.ticketMet ? 'bg-gradient-to-r from-green-50 to-emerald-50 border-green-200' : 'bg-gradient-to-r from-red-50 to-orange-50 border-red-200'} border-b px-4 py-3 animate-slide-up`}>
+              <div className="flex items-center justify-between mb-2">
+                <span className={`text-sm font-medium ${state.ticketMet ? 'text-green-700' : 'text-red-700'}`}>
+                  {state.ticketMet ? '✅ Nailed it! Management is delighted.' : '❌ Didn\'t quite sell it. Management is... disappointed.'}
+                </span>
+                <button onClick={() => dispatch({ type: 'NEXT_ROUND' })}
+                  className="bg-gradient-to-r from-green-600 to-emerald-500 text-white px-5 py-1.5 rounded-lg text-sm font-medium hover:from-green-500 hover:to-emerald-400 transition-all hover:scale-105 shadow-sm shrink-0 ml-3">
+                  Next Round 🎲
+                </button>
+              </div>
+
+              {/* Score changes */}
+              {state.previousScores && (
+                <div className="flex flex-wrap gap-3 text-xs mb-2">
+                  {[
+                    { label: '⭐ Reputation', prev: state.previousScores.reputation, cur: state.scores.reputation, delta: state.scoreDeltas?.reputation, goodUp: true },
+                    { label: '👁 Suspicion', prev: state.previousScores.suspicion, cur: state.scores.suspicion, delta: state.scoreDeltas?.suspicion, goodUp: false },
+                    { label: '💎 Integrity', prev: state.previousScores.integrity, cur: state.scores.integrity, delta: state.scoreDeltas?.integrity, goodUp: false },
+                  ].map(s => {
+                    const isGood = s.goodUp ? (s.delta > 0) : (s.delta < 0);
+                    const isBad = s.goodUp ? (s.delta < 0) : (s.delta > 0);
+                    return (
+                      <span key={s.label} className="bg-white/60 rounded px-2 py-1 border border-gray-200">
+                        {s.label} {s.prev} → <span className="font-semibold">{s.cur}</span>
+                        {s.delta !== 0 && <span className={`ml-1 font-medium ${isGood ? 'text-green-600' : isBad ? 'text-red-600' : 'text-gray-500'}`}>({s.delta > 0 ? '+' : ''}{s.delta})</span>}
+                      </span>
+                    );
+                  })}
+                </div>
+              )}
+
+              {/* Itemized manipulation costs */}
+              {state.lastRoundManipDetails && state.lastRoundManipDetails.length > 0 && (
+                <div className="text-xs text-gray-600 space-y-0.5">
+                  {state.lastRoundManipDetails.map((d, i) => (
+                    <div key={i} className="flex items-center gap-1">
+                      <span className="text-gray-400">•</span>
+                      <span>{d.metricName}: {d.desc}</span>
+                      <span className="text-orange-500 font-medium ml-auto">+{d.suspCost} 👁</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {/* Contradictions */}
+              {state.contradictions.length > 0 && (
+                <div className="mt-2 text-xs text-amber-700 bg-amber-50 rounded px-2 py-1 border border-amber-200">
+                  🕵️ {state.contradictions.length} inconsistenc{state.contradictions.length === 1 ? 'y' : 'ies'}: {state.contradictions.map(c => c.detail).join(' · ')}
+                </div>
+              )}
             </div>
           )}
 
@@ -1576,6 +1730,15 @@ export default function DashAndBurn() {
               </div>
             </div>
 
+            {/* Contradiction warnings during manipulation */}
+            {state.phase === 'manipulation' && state.contradictions.length > 0 && (
+              <div className="mx-3 sm:mx-4 mb-2 text-xs text-amber-700 bg-amber-50 rounded-lg px-3 py-2 border border-amber-200 animate-slide-up">
+                <span className="font-medium">⚠️ {state.contradictions.length} inconsistenc{state.contradictions.length === 1 ? 'y' : 'ies'} detected</span>
+                <span className="text-amber-600"> — {state.contradictions.map(c => c.detail).join(' · ')}</span>
+                <span className="text-amber-500 ml-1">(+{state.contradictions.length * 2} 👁 at submission)</span>
+              </div>
+            )}
+
             {/* Filter panel */}
             {state.showFilterPanel && state.selectedMetric && state.phase === 'manipulation' && (
               <FilterPanel
@@ -1585,6 +1748,7 @@ export default function DashAndBurn() {
                 manipTypeCounts={state.manipulationTypeCounts}
                 round={state.round}
                 currentTicket={state.currentTicket}
+                pendingManipulations={state.pendingManipulations}
               />
             )}
           </div>
